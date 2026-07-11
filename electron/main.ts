@@ -12,6 +12,7 @@ import {
 	Tray,
 } from "electron";
 import { ShortcutBinding } from "../src/lib/shortcuts";
+import { isDiagnosticModeEnabled, mainLogBuffer } from "./diagnostics/main-log-buffer";
 import {
 	loadAndRegisterGlobalShortcut,
 	registerOpenAppShortcut,
@@ -19,24 +20,25 @@ import {
 } from "./globalShortcut";
 import { mainT, setMainLocale } from "./i18n";
 import { getSelectedDesktopSource, registerIpcHandlers } from "./ipc/handlers";
+import { acquireStableInstanceLock } from "./singleInstanceLock";
 import {
 	createCountdownOverlayWindow,
 	createEditorWindow,
 	createHudOverlayWindow,
+	createNotesWindow,
 	createSourceSelectorWindow,
 } from "./windows";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Use Screen & System Audio Recording permissions instead of CoreAudio Tap API on macOS.
-// CoreAudio Tap requires NSAudioCaptureUsageDescription in the parent app's Info.plist,
-// which doesn't work when running from a terminal/IDE during development, makes my life easier
+// Use Screen & System Audio Recording permissions instead of the CoreAudio Tap API on macOS.
+// Tap needs NSAudioCaptureUsageDescription in the parent app's Info.plist, which breaks when
+// running from a terminal/IDE during dev.
 if (process.platform === "darwin") {
 	app.commandLine.appendSwitch("disable-features", "MacCatapLoopbackAudioForScreenShare");
 }
 
-// Enable Wayland support for proper screen capture and window management
-// on Wayland compositors (Hyprland, GNOME, KDE, etc.)
+// Wayland support for screen capture and window management on Wayland compositors.
 if (process.platform === "linux") {
 	const isWayland =
 		process.env.XDG_SESSION_TYPE === "wayland" || process.env.WAYLAND_DISPLAY !== undefined;
@@ -83,6 +85,7 @@ process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL
 let mainWindow: BrowserWindow | null = null;
 let sourceSelectorWindow: BrowserWindow | null = null;
 let countdownOverlayWindow: BrowserWindow | null = null;
+let notesWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let selectedSourceName = "";
 const isMac = process.platform === "darwin";
@@ -93,6 +96,10 @@ const defaultTrayIcon = getTrayIcon("openscreen.png", trayIconSize);
 const recordingTrayIcon = getTrayIcon("rec-button.png", trayIconSize);
 
 function createWindow() {
+	if (mainWindow && !mainWindow.isDestroyed()) {
+		return;
+	}
+
 	mainWindow = createHudOverlayWindow();
 }
 
@@ -107,6 +114,19 @@ function showMainWindow() {
 	}
 
 	createWindow();
+}
+
+const stableInstanceLock = acquireStableInstanceLock();
+const hasElectronSingleInstanceLock = app.requestSingleInstanceLock();
+const hasSingleInstanceLock = Boolean(stableInstanceLock && hasElectronSingleInstanceLock);
+
+if (hasSingleInstanceLock) {
+	app.on("second-instance", () => {
+		showMainWindow();
+	});
+} else {
+	stableInstanceLock?.release();
+	app.quit();
 }
 
 function isEditorWindow(window: BrowserWindow) {
@@ -384,7 +404,7 @@ function createEditorWindowWrapper() {
 		const windowToClose = mainWindow;
 		if (!windowToClose || windowToClose.isDestroyed()) return;
 
-		// Ask renderer to show the custom in-app dialog
+		// Ask renderer to show the in-app close dialog.
 		windowToClose.webContents.send("request-close-confirm");
 
 		ipcMain.once("close-confirm-response", (event, choice: "save" | "discard" | "cancel") => {
@@ -393,7 +413,7 @@ function createEditorWindowWrapper() {
 			if (!windowToClose || windowToClose.isDestroyed()) return;
 
 			if (choice === "save") {
-				// Tell renderer to save the project, then close when done
+				// Save first, then close when the renderer reports done.
 				windowToClose.webContents.send("request-save-before-close");
 				ipcMain.once("save-before-close-done", (event, shouldClose: boolean) => {
 					if (event.sender.id !== windowToClose?.webContents.id) return;
@@ -412,8 +432,24 @@ function createSourceSelectorWindowWrapper() {
 	sourceSelectorWindow = createSourceSelectorWindow();
 	sourceSelectorWindow.on("closed", () => {
 		sourceSelectorWindow = null;
+		if (mainWindow && !mainWindow.isDestroyed()) {
+			mainWindow.webContents.send("source-selector-closed");
+		}
 	});
 	return sourceSelectorWindow;
+}
+
+function createNotesWindowWrapper() {
+	{
+		notesWindow = createNotesWindow();
+		notesWindow.on("closed", () => {
+			notesWindow = null;
+			if (mainWindow && !mainWindow.isDestroyed()) {
+				mainWindow.webContents.send("notes-window-closed");
+			}
+		});
+		return notesWindow;
+	}
 }
 
 function createCountdownOverlayWindowWrapper() {
@@ -428,16 +464,14 @@ function createCountdownOverlayWindowWrapper() {
 	return countdownOverlayWindow;
 }
 
-// Closing every window quits the app entirely (tray icon goes too).
-// The in-app "Return to Recorder" button covers the editor → HUD round-trip,
-// so closing the last window is an explicit "I'm done" signal.
+// Closing every window quits the app (tray goes too). The in-app "Return to Recorder"
+// button covers the editor-to-HUD round-trip, so closing the last window means "I'm done".
 app.on("window-all-closed", () => {
 	app.quit();
 });
 
 app.on("activate", () => {
-	// On OS X it's common to re-create a window in the app when the
-	// dock icon is clicked and there are no other windows open.
+	// On macOS, re-open a window when the dock icon is clicked and none are open.
 	const hasVisibleWindow = BrowserWindow.getAllWindows().some((window) => {
 		if (window.isDestroyed() || !window.isVisible()) {
 			return false;
@@ -454,18 +488,24 @@ app.on("activate", () => {
 
 app.on("will-quit", () => {
 	unregisterAllGlobalShortcuts();
+	stableInstanceLock?.release();
 });
 
-// Register all IPC handlers when app is ready
-app.whenReady().then(async () => {
-	// Force the app into "regular" activation policy so the Dock icon appears.
-	// The HUD overlay (transparent + frameless + skipTaskbar) is the first
-	// window we open, and AppKit otherwise classifies us as an accessory app.
+const appReady = hasSingleInstanceLock ? app.whenReady() : null;
+
+appReady?.then(async () => {
+	if (isDiagnosticModeEnabled()) {
+		mainLogBuffer.install();
+		console.info("[diagnostic] OPENSCREEN_DIAGNOSTIC=1, capturing console.* into ring buffer");
+	}
+
+	// Force "regular" activation policy so the Dock icon appears. The HUD overlay
+	// (transparent, frameless, skipTaskbar) is the first window, and AppKit would
+	// otherwise classify us as an accessory app.
 	if (process.platform === "darwin") {
 		app.dock?.show();
 	}
 
-	// Allow microphone/media/screen permission checks
 	session.defaultSession.setPermissionCheckHandler((_webContents, permission) => {
 		const allowed = [
 			"media",
@@ -508,9 +548,8 @@ app.whenReady().then(async () => {
 		{ useSystemPicker: false },
 	);
 
-	// Request microphone permission from macOS. Screen Recording is requested
-	// lazily from the source-picker action so the system prompt is not hidden
-	// behind OpenScreen's source selector window.
+	// Request mic permission now. Screen Recording is requested lazily from the
+	// source-picker action so its prompt isn't hidden behind the selector window.
 	if (process.platform === "darwin") {
 		const micStatus = systemPreferences.getMediaAccessStatus("microphone");
 		if (micStatus !== "granted") {
@@ -518,7 +557,6 @@ app.whenReady().then(async () => {
 		}
 	}
 
-	// Listen for HUD overlay quit event (macOS only)
 	ipcMain.on("hud-overlay-close", () => {
 		app.quit();
 	});
@@ -536,7 +574,6 @@ app.whenReady().then(async () => {
 	createTray();
 	updateTrayMenu();
 	setupApplicationMenu();
-	// Ensure recordings directory exists
 	await ensureRecordingsDir();
 
 	function switchToHudWrapper() {
@@ -553,8 +590,10 @@ app.whenReady().then(async () => {
 		createEditorWindowWrapper,
 		createSourceSelectorWindowWrapper,
 		createCountdownOverlayWindowWrapper,
+		createNotesWindowWrapper,
 		() => mainWindow,
 		() => sourceSelectorWindow,
+		() => notesWindow,
 		() => countdownOverlayWindow,
 		(recording: boolean, sourceName: string) => {
 			selectedSourceName = sourceName;

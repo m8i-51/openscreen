@@ -11,7 +11,7 @@
 buildNpmPackage {
   nodejs = nodejs_22;
   pname = "openscreen";
-  version = "1.4.0";
+  version = "1.6.0";
 
   src =
     let
@@ -33,7 +33,7 @@ buildNpmPackage {
       );
     };
 
-  npmDepsHash = "sha256-tOpoJPzaZDK3HJijGHpZ0+jWsbrYyQUuw1pO0Uxcifg=";
+  npmDepsHash = "sha256-IZypOLWlDShIjCKWxlJcrdtIkMu0P/DuXaq4c0HW3FY=";
 
   env.ELECTRON_SKIP_BINARY_DOWNLOAD = "1";
 
@@ -116,7 +116,7 @@ buildNpmPackage {
 
   meta = {
     description = "Desktop screen recorder with built-in editor";
-    homepage = "https://github.com/siddharthvaddem/openscreen";
+    homepage = "https://github.com/EtienneLescot/openscreen";
     license = lib.licenses.mit;
     mainProgram = "openscreen";
     platforms = lib.platforms.linux;

@@ -4,6 +4,7 @@ import {
 	getNativeCursorClickBounceProgress,
 	getNativeCursorClickBounceScale,
 	hasNativeCursorRecordingData,
+	projectNativeCursorToLocal,
 	resolveInterpolatedNativeCursorFrame,
 	resolveNativeCursorRenderAsset,
 } from "./nativeCursor";
@@ -99,5 +100,186 @@ describe("native cursor click bounce", () => {
 		};
 
 		expect(getNativeCursorClickBounceProgress(recordingData, 133)).toBeGreaterThan(0);
+	});
+});
+
+describe("custom cursor themes", () => {
+	const arrowAsset: NativeCursorAsset = {
+		id: "telemetry-arrow",
+		platform: "darwin",
+		imageDataUrl: "default-arrow",
+		width: 32,
+		height: 32,
+		hotspotX: 16,
+		hotspotY: 15,
+		cursorType: "arrow",
+	};
+
+	it("substitutes the themed art for an overridden cursor type", () => {
+		const rendered = resolveNativeCursorRenderAsset(
+			arrowAsset,
+			1,
+			{ timeMs: 0, cx: 0.5, cy: 0.5, cursorType: "arrow" },
+			"hello-kitty-watermelon",
+		);
+
+		expect(rendered.id).toBe("theme:hello-kitty-watermelon:arrow");
+		expect(rendered.imageDataUrl).toContain("cursors/hello-kitty-watermelon/arrow.png");
+		expect(rendered.width).toBe(32);
+		expect(rendered.hotspotX).toBeCloseTo(1.5);
+	});
+
+	it("classifies an untyped macOS arrow bitmap (top-left hotspot) as the themed arrow", () => {
+		const macArrow: NativeCursorAsset = {
+			id: "sha-arrow",
+			platform: "darwin",
+			imageDataUrl: "captured-bitmap",
+			width: 34,
+			height: 46,
+			hotspotX: 8,
+			hotspotY: 8,
+			scaleFactor: 2,
+		};
+		const rendered = resolveNativeCursorRenderAsset(
+			macArrow,
+			1,
+			{ timeMs: 0, cx: 0.5, cy: 0.5 },
+			"hello-kitty-watermelon",
+		);
+
+		expect(rendered.id).toBe("theme:hello-kitty-watermelon:arrow");
+		expect(rendered.imageDataUrl).toContain("cursors/hello-kitty-watermelon/arrow.png");
+	});
+
+	it("classifies an untyped macOS hand bitmap (upper-center hotspot) as the themed pointer", () => {
+		const macHand: NativeCursorAsset = {
+			id: "sha-hand",
+			platform: "darwin",
+			imageDataUrl: "captured-bitmap",
+			width: 64,
+			height: 64,
+			hotspotX: 26,
+			hotspotY: 16,
+			scaleFactor: 2,
+		};
+		const rendered = resolveNativeCursorRenderAsset(
+			macHand,
+			1,
+			{ timeMs: 0, cx: 0.5, cy: 0.5 },
+			"hello-kitty-watermelon",
+		);
+
+		expect(rendered.id).toBe("theme:hello-kitty-watermelon:pointer");
+		expect(rendered.imageDataUrl).toContain("cursors/hello-kitty-watermelon/pointer.png");
+	});
+
+	it("leaves an untyped text/crosshair bitmap (centered hotspot) as the real captured cursor", () => {
+		const macText: NativeCursorAsset = {
+			id: "sha-text",
+			platform: "darwin",
+			imageDataUrl: "captured-ibeam",
+			width: 18,
+			height: 36,
+			hotspotX: 8,
+			hotspotY: 18,
+			scaleFactor: 2,
+		};
+		const rendered = resolveNativeCursorRenderAsset(
+			macText,
+			1,
+			{ timeMs: 0, cx: 0.5, cy: 0.5 },
+			"hello-kitty-watermelon",
+		);
+
+		expect(rendered.id).toBe("sha-text");
+		expect(rendered.imageDataUrl).toBe("captured-ibeam");
+	});
+
+	it("keeps the default art for the default theme id", () => {
+		const rendered = resolveNativeCursorRenderAsset(
+			arrowAsset,
+			1,
+			{ timeMs: 0, cx: 0.5, cy: 0.5, cursorType: "arrow" },
+			"default",
+		);
+
+		expect(rendered.id).toBe("pretty:arrow");
+		expect(rendered.imageDataUrl).not.toContain("hello-kitty-watermelon");
+	});
+
+	it("falls back to default art for a cursor type the theme does not override", () => {
+		const rendered = resolveNativeCursorRenderAsset(
+			{ ...arrowAsset, cursorType: "text" },
+			1,
+			{ timeMs: 0, cx: 0.5, cy: 0.5, cursorType: "text" },
+			"hello-kitty-watermelon",
+		);
+
+		expect(rendered.id).toBe("pretty:text");
+	});
+});
+
+describe("projectNativeCursorToLocal", () => {
+	const identityCrop = { x: 0, y: 0, width: 1, height: 1 };
+
+	it("maps a sample onto the supplied painted rectangle 1:1 with no crop", () => {
+		const point = projectNativeCursorToLocal({
+			cropRegion: identityCrop,
+			maskRect: { x: 100, y: 200, width: 1280, height: 720 },
+			sample: { timeMs: 0, cx: 0.25, cy: 0.5, visible: true },
+		});
+
+		expect(point?.x).toBeCloseTo(100 + 0.25 * 1280);
+		expect(point?.y).toBeCloseTo(200 + 0.5 * 720);
+	});
+
+	it("maps a sample into the cropped region of the painted rectangle", () => {
+		const point = projectNativeCursorToLocal({
+			cropRegion: { x: 0.25, y: 0.0, width: 0.5, height: 1.0 },
+			maskRect: { x: 0, y: 0, width: 1920, height: 1080 },
+			sample: { timeMs: 0, cx: 0.5, cy: 0.5, visible: true },
+		});
+
+		expect(point?.x).toBeCloseTo(0 + ((0.5 - 0.25) / 0.5) * 1920);
+		expect(point?.y).toBeCloseTo(0 + (0.5 / 1.0) * 1080);
+	});
+
+	it("projects onto the cropped (cover-overflowing) painted rect, not the mask rect", () => {
+		const screenRect = { x: 0, y: 0, width: 1920, height: 1080 };
+		const croppedRect = { x: 0, y: -540, width: 1920, height: 2160 };
+
+		const point = projectNativeCursorToLocal({
+			cropRegion: { x: 0.0, y: 0.0, width: 0.5, height: 1.0 },
+			maskRect: croppedRect,
+			sample: { timeMs: 0, cx: 0.25, cy: 0.25, visible: true },
+		});
+
+		const wrong = screenRect.y + 0.25 * screenRect.height;
+		expect(wrong).toBe(270);
+
+		expect(point?.x).toBeCloseTo(croppedRect.x + ((0.25 - 0) / 0.5) * croppedRect.width);
+		expect(point?.y).toBeCloseTo(croppedRect.y + (0.25 / 1.0) * croppedRect.height);
+		expect(point?.y).toBe(0);
+		expect(point?.y).not.toBe(wrong);
+	});
+
+	it("returns null for a sample outside the cropped region", () => {
+		const point = projectNativeCursorToLocal({
+			cropRegion: { x: 0.25, y: 0.25, width: 0.5, height: 0.5 },
+			maskRect: { x: 0, y: 0, width: 1920, height: 1080 },
+			sample: { timeMs: 0, cx: 0.1, cy: 0.5, visible: true },
+		});
+
+		expect(point).toBeNull();
+	});
+
+	it("returns null for a degenerate (zero-size) crop region", () => {
+		const point = projectNativeCursorToLocal({
+			cropRegion: { x: 0, y: 0, width: 0, height: 1 },
+			maskRect: { x: 0, y: 0, width: 1920, height: 1080 },
+			sample: { timeMs: 0, cx: 0.5, cy: 0.5, visible: true },
+		});
+
+		expect(point).toBeNull();
 	});
 });

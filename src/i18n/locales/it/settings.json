@@ -45,7 +45,10 @@
 		"dualFrame": "Doppio frame",
 		"noWebcam": "Nessuna webcam",
 		"webcamShape": "Forma fotocamera",
-		"webcamSize": "Dimensione webcam"
+		"webcamSize": "Dimensione webcam",
+		"mirrorWebcam": "Specchia webcam",
+		"reactiveWebcam": "Riduci con lo zoom",
+		"reactiveWebcamDescription": "La webcam si riduce dolcemente durante lo zoom, così non intralcia."
 	},
 	"effects": {
 		"title": "Effetti video",
@@ -161,8 +164,7 @@
 		"tipShiftTabCycle": "Usa Maiusc+Tab per scorrere all'indietro.",
 		"invalidImageType": "Tipo di file non valido",
 		"imageFormatsOnly": "Carica un file immagine JPG, PNG, GIF o WebP.",
-		"imageUploadSuccess": "Immagine caricata con successo!",
-		"failedImageUpload": "Impossibile caricare l'immagine"
+		"imageUploadSuccess": "Immagine caricata con successo!"
 	},
 	"fontStyles": {
 		"classic": "Classico",
@@ -205,6 +207,8 @@
 		"errorLoadFailed": "Impossibile caricare il font. Verifica che l'URL di Google Fonts sia corretto."
 	},
 	"cursor": {
+		"theme": "Stile del cursore",
+		"themeDefault": "Predefinito",
 		"show": "Mostra cursore",
 		"size": "Dimensione",
 		"smoothing": "Smussatura",

@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from "react";
+import { materializeLocalSourceFile, releaseLocalSourceFile } from "@/lib/exporter/localSourceFile";
+import { MAX_IN_MEMORY_SOURCE_BYTES } from "@/lib/exporter/sourceFileLimits";
 import { loadFileAsArrayBuffer } from "@/lib/exporter/streamingDecoder";
+import { computePeaksFromFileStreaming } from "./streamingAudioPeaks";
 
 let _audioCtx: AudioContext | null = null;
 /** Returns the shared AudioContext, creating it lazily on first call. */
@@ -10,8 +13,7 @@ function getAudioCtx(): AudioContext {
 
 /**
  * Offloads peak computation to a Web Worker (zero-copy via Transferable).
- * Accepts an optional AbortSignal — if aborted, the worker is terminated
- * immediately and the promise rejects with an AbortError.
+ * On abort, the worker is terminated and the promise rejects with AbortError.
  */
 function computePeaksInWorker(
 	audioBuffer: AudioBuffer,
@@ -60,15 +62,38 @@ function computePeaksInWorker(
 }
 
 /**
- * Decodes audio from `videoUrl` and returns a Float32Array of paired
- * [min, max] peak values (length = 2 * N blocks). Returns `null` while
- * decoding is in progress, and stays `null` when the file has no audio
- * track or decoding fails (silent degradation).
- *
- * - File loading uses the Electron IPC bridge for local paths (same as the exporter).
- * - Peak computation runs in a Web Worker to avoid blocking the main thread.
- * - Results are cached in a ref scoped to the hook instance (survives re-renders
- *   and waveform toggle off/on, but not component unmount).
+ * Routes to the right peaks pipeline for the source size. Small/remote files
+ * use the original decodeAudioData → worker path. Local recordings above the
+ * in-memory limit stream instead: the file is materialized into OPFS (reused by
+ * the export afterwards) and its audio is decoded chunk-by-chunk into peaks, so
+ * the whole recording is never held in memory.
+ */
+async function computePeaksForUrl(videoUrl: string, signal?: AbortSignal): Promise<Float32Array> {
+	const isRemoteUrl = /^(https?:|blob:|data:)/i.test(videoUrl);
+	if (!isRemoteUrl && window.electronAPI?.getReadableFileInfo) {
+		const info = await window.electronAPI.getReadableFileInfo(videoUrl);
+		if (info.success && typeof info.size === "number" && info.size > MAX_IN_MEMORY_SOURCE_BYTES) {
+			const filename = (videoUrl.split(/[\\/]/).pop() || "video").replace(/^file:/, "");
+			// signal also aborts the OPFS copy (unless the export shares it).
+			const file = await materializeLocalSourceFile(videoUrl, filename, { signal });
+			try {
+				return await computePeaksFromFileStreaming(file, signal);
+			} finally {
+				releaseLocalSourceFile(file.name);
+			}
+		}
+	}
+
+	const { data: arrayBuffer } = await loadFileAsArrayBuffer(videoUrl);
+	const audioBuffer = await getAudioCtx().decodeAudioData(arrayBuffer);
+	return computePeaksInWorker(audioBuffer, signal);
+}
+
+/**
+ * Decodes audio from `videoUrl` into paired [min, max] peaks (length = 2 * N
+ * blocks). Returns `null` while decoding, and stays `null` on no audio track or
+ * decode failure (silent degradation). Results are cached in a ref scoped to the
+ * hook instance, so they survive re-renders and waveform toggles but not unmount.
  */
 export function useAudioPeaks(videoUrl?: string): Float32Array | null {
 	const cacheRef = useRef<Map<string, Float32Array>>(new Map());
@@ -94,18 +119,16 @@ export function useAudioPeaks(videoUrl?: string): Float32Array | null {
 
 		(async () => {
 			try {
-				const { data: arrayBuffer } = await loadFileAsArrayBuffer(videoUrl);
-				if (cancelled) return;
-				const audioBuffer = await getAudioCtx().decodeAudioData(arrayBuffer);
-				if (cancelled) return;
-				const p = await computePeaksInWorker(audioBuffer, controller.signal);
+				const p = await computePeaksForUrl(videoUrl, controller.signal);
 				if (cancelled) return;
 				cacheRef.current.set(videoUrl, p);
 				setPeaks(p);
 			} catch (err) {
-				// AbortError means the effect cleaned up — no state update needed.
+				// AbortError means the effect cleaned up, so no state update needed.
 				if (err instanceof DOMException && err.name === "AbortError") return;
-				// No audio track or unsupported format — clear stale data silently.
+				// No audio track or unsupported format: degrade to no waveform, but log
+				// so an unexpectedly-missing waveform is diagnosable.
+				console.warn("useAudioPeaks: could not decode audio for waveform:", err);
 				if (!cancelled) setPeaks(null);
 			}
 		})();

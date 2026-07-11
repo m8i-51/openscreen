@@ -29,6 +29,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	moveHudOverlayBy: (deltaX: number, deltaY: number) => {
 		ipcRenderer.send("hud-overlay-move-by", deltaX, deltaY);
 	},
+	setHudOverlaySize: (width: number, height: number) => {
+		ipcRenderer.send("hud-overlay-set-size", width, height);
+	},
 	getSources: async (opts: Electron.SourcesOptions) => {
 		return await ipcRenderer.invoke("get-sources", opts);
 	},
@@ -44,11 +47,24 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	openSourceSelector: () => {
 		return ipcRenderer.invoke("open-source-selector");
 	},
+	openNotes: () => {
+		return ipcRenderer.invoke("open-notes");
+	},
 	selectSource: (source: ProcessedDesktopSource) => {
 		return ipcRenderer.invoke("select-source", source);
 	},
 	getSelectedSource: () => {
 		return ipcRenderer.invoke("get-selected-source");
+	},
+	onSelectedSourceChanged: (callback: (source: ProcessedDesktopSource) => void) => {
+		const listener = (_event: unknown, source: ProcessedDesktopSource) => callback(source);
+		ipcRenderer.on("selected-source-changed", listener);
+		return () => ipcRenderer.removeListener("selected-source-changed", listener);
+	},
+	onSourceSelectorClosed: (callback: () => void) => {
+		const listener = () => callback();
+		ipcRenderer.on("source-selector-closed", listener);
+		return () => ipcRenderer.removeListener("source-selector-closed", listener);
 	},
 	requestCameraAccess: () => {
 		return ipcRenderer.invoke("request-camera-access");
@@ -161,6 +177,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	readBinaryFile: (filePath: string) => {
 		return ipcRenderer.invoke("read-binary-file", filePath);
 	},
+	getReadableFileInfo: (filePath: string) => {
+		return ipcRenderer.invoke("get-readable-file-info", filePath);
+	},
+	readFileChunk: (filePath: string, offset: number, length: number) => {
+		return ipcRenderer.invoke("read-file-chunk", filePath, offset, length);
+	},
 	preparePreviewAudioTrack: (filePath: string) => {
 		return ipcRenderer.invoke("prepare-preview-audio-track", filePath);
 	},
@@ -170,8 +192,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	saveProjectFile: (projectData: unknown, suggestedName?: string, existingProjectPath?: string) => {
 		return ipcRenderer.invoke("save-project-file", projectData, suggestedName, existingProjectPath);
 	},
-	loadProjectFile: () => {
-		return ipcRenderer.invoke("load-project-file");
+	loadProjectFile: (projectFolder?: string) => {
+		return ipcRenderer.invoke("load-project-file", projectFolder);
 	},
 	loadProjectFileFromPath: (filePath: string) => {
 		return ipcRenderer.invoke("load-project-file-from-path", filePath);

@@ -50,6 +50,7 @@ const WEBCAM_TARGET_FRAME_RATE = 30;
 type UseScreenRecorderReturn = {
 	recording: boolean;
 	paused: boolean;
+	saving: boolean;
 	elapsedSeconds: number;
 	toggleRecording: () => void;
 	togglePaused: () => void;
@@ -91,6 +92,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	const t = useScopedT("editor");
 	const [recording, setRecording] = useState(false);
 	const [paused, setPaused] = useState(false);
+	const [saving, setSaving] = useState(false);
 	const [elapsedSeconds, setElapsedSeconds] = useState(0);
 	const [microphoneEnabled, setMicrophoneEnabled] = useState(false);
 	const [microphoneDeviceId, setMicrophoneDeviceId] = useState<string | undefined>(undefined);
@@ -135,10 +137,9 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	}, []);
 
 	const selectMimeType = () => {
-		// H.264 first: hardware-accelerated on all modern devices, gives sharp
-		// real-time output. AV1/VP9 are great for distribution but too
-		// CPU-intensive for live 60 fps capture — they produce blurry frames
-		// when the software encoder can't keep up.
+		// H.264 first: hardware-accelerated, so sharp real-time output. AV1/VP9 are
+		// better for distribution but too CPU-heavy for live 60 fps capture (software
+		// encoder falls behind and produces blurry frames).
 		const preferred = [
 			"video/webm;codecs=h264",
 			"video/webm;codecs=vp8",
@@ -311,6 +312,12 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				return;
 			}
 			finalizingRecordingId.current = activeRecordingId;
+			// Only show the "Saving…" spinner for genuine saves — not for cancel/restart
+			// flows where discardRecordingId has already been set.
+			const isDiscarded = discardRecordingId.current === activeRecordingId;
+			if (!isDiscarded) {
+				setSaving(true);
+			}
 
 			if (screenRecorder.current === activeScreenRecorder) {
 				screenRecorder.current = null;
@@ -339,7 +346,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 						window.electronAPI?.discardCursorTelemetry(activeRecordingId);
 						return;
 					}
-					// When streaming succeeded the blob is empty — the data is already on disk.
+					// When streaming succeeded the blob is empty; the data is already on disk.
 					if (!activeScreenRecorder.isStreaming() && screenBlob.size === 0) {
 						return;
 					}
@@ -398,10 +405,9 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				} catch (error) {
 					console.error("Error saving recording:", error);
 				} finally {
-					// Discard any recorder whose data was not part of a successful save
-					// — a discarded run, a failed save, or a webcam whose disk write
-					// failed (so it was omitted while the screen still saved) — so no
-					// stream or partial file is left open or orphaned.
+					// Discard any recorder whose data wasn't part of a successful save (discarded
+					// run, failed save, or a webcam whose disk write failed while the screen still
+					// saved) so no stream or partial file is left open or orphaned.
 					if (!storeSucceeded) {
 						await activeScreenRecorder.discard().catch(() => undefined);
 					}
@@ -414,6 +420,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 					if (discardRecordingId.current === activeRecordingId) {
 						discardRecordingId.current = null;
 					}
+					setSaving(false);
 				}
 			})();
 		},
@@ -428,6 +435,9 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			}
 
 			activeNativeRecording.finalizing = true;
+			if (!discard) {
+				setSaving(true);
+			}
 			const activeWebcamRecorder = activeNativeRecording.webcamRecorder;
 			const duration = Math.max(0, getRecordingDurationMs());
 			if (
@@ -515,6 +525,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				if (discardRecordingId.current === activeNativeRecording.recordingId) {
 					discardRecordingId.current = null;
 				}
+				setSaving(false);
 			}
 		},
 		[cursorCaptureMode, getRecordingDurationMs],
@@ -528,6 +539,9 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			}
 
 			activeNativeRecording.finalizing = true;
+			if (!discard) {
+				setSaving(true);
+			}
 			const duration = Math.max(0, getRecordingDurationMs());
 			const activeWebcamRecorder = webcamRecorder.current;
 			if (activeWebcamRecorder && webcamRecorder.current === activeWebcamRecorder) {
@@ -615,6 +629,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				if (discardRecordingId.current === activeNativeRecording.recordingId) {
 					discardRecordingId.current = null;
 				}
+				setSaving(false);
 			}
 		},
 		[cursorCaptureMode, getRecordingDurationMs],
@@ -1069,9 +1084,11 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 		try {
 			const platform = await window.electronAPI.getPlatform();
 			if (platform === "darwin" && cursorCaptureMode === "editable-overlay") {
+				// The main process shows a native dialog that deep-links to the
+				// Accessibility settings pane when access is missing, so we just stop
+				// here and let the user grant it and press record again.
 				const access = await window.electronAPI.requestNativeMacCursorAccess();
 				if (!access.granted) {
-					toast.info(t("recording.accessibilityAllowAndRetry"));
 					return;
 				}
 			}
@@ -1421,6 +1438,9 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 						if (!result.success) {
 							throw new Error(result.error ?? "Failed to resume native Windows recording");
 						}
+						if (activeNativeWindowsRecording.webcamRecorder?.recorder.state === "paused") {
+							activeNativeWindowsRecording.webcamRecorder.recorder.resume();
+						}
 						activeNativeWindowsRecording.paused = false;
 						segmentStartedAt.current = Date.now();
 						setPaused(false);
@@ -1431,6 +1451,9 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 					const result = await window.electronAPI.pauseNativeWindowsRecording();
 					if (!result.success) {
 						throw new Error(result.error ?? "Failed to pause native Windows recording");
+					}
+					if (activeNativeWindowsRecording.webcamRecorder?.recorder.state === "recording") {
+						activeNativeWindowsRecording.webcamRecorder.recorder.pause();
 					}
 					activeNativeWindowsRecording.paused = true;
 					accumulatedDurationMs.current = pausedAtMs;
@@ -1660,6 +1683,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 	return {
 		recording,
 		paused,
+		saving,
 		elapsedSeconds,
 		toggleRecording,
 		togglePaused,

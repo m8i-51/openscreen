@@ -45,7 +45,10 @@
 		"dualFrame": "Double cadre",
 		"webcamShape": "Forme de la caméra",
 		"webcamSize": "Taille de la caméra",
-		"noWebcam": "Sans webcam"
+		"noWebcam": "Sans webcam",
+		"mirrorWebcam": "Inverser la webcam",
+		"reactiveWebcam": "Réduire au zoom",
+		"reactiveWebcamDescription": "La caméra rétrécit doucement pendant le zoom, pour ne pas gêner."
 	},
 	"effects": {
 		"title": "Effets vidéo",
@@ -162,8 +165,7 @@
 		"tipShiftTabCycle": "Utilisez Shift+Tab pour cycler en sens inverse.",
 		"invalidImageType": "Type de fichier invalide",
 		"imageFormatsOnly": "Veuillez téléverser un fichier image JPG, PNG, GIF ou WebP.",
-		"imageUploadSuccess": "Image téléversée avec succès !",
-		"failedImageUpload": "Échec du téléversement de l'image"
+		"imageUploadSuccess": "Image téléversée avec succès !"
 	},
 	"fontStyles": {
 		"classic": "Classique",
@@ -206,6 +208,8 @@
 		"errorLoadFailed": "La police n'a pas pu être chargée. Vérifiez que l'URL Google Fonts est correcte."
 	},
 	"cursor": {
+		"theme": "Style du curseur",
+		"themeDefault": "Par défaut",
 		"show": "Afficher le curseur",
 		"size": "Taille",
 		"smoothing": "Lissage",

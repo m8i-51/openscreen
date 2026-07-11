@@ -45,7 +45,10 @@
 		"dualFrame": "Khung kép",
 		"webcamShape": "Hình dạng máy ảnh",
 		"webcamSize": "Kích thước Webcam",
-		"noWebcam": "Không có webcam"
+		"noWebcam": "Không có webcam",
+		"mirrorWebcam": "Lật webcam",
+		"reactiveWebcam": "Thu nhỏ khi phóng to",
+		"reactiveWebcamDescription": "Camera thu nhỏ mượt mà khi video được phóng to, để không che khuất."
 	},
 	"effects": {
 		"title": "Hiệu ứng video",
@@ -163,7 +166,6 @@
 		"invalidImageType": "Loại tệp không hợp lệ",
 		"imageFormatsOnly": "Vui lòng tải lên tệp hình ảnh JPG, PNG, GIF hoặc WebP.",
 		"imageUploadSuccess": "Tải lên hình ảnh thành công!",
-		"failedImageUpload": "Tải lên hình ảnh thất bại",
 		"colorPalette": "Bảng màu",
 		"colorWheel": "Vòng màu"
 	},
@@ -197,6 +199,8 @@
 		"errorLoadFailed": "Không thể tải phông chữ. Vui lòng xác minh URL Google Fonts là chính xác."
 	},
 	"cursor": {
+		"theme": "Kiểu con trỏ",
+		"themeDefault": "Mặc định",
 		"show": "Hiện con trỏ",
 		"size": "Kích thước",
 		"smoothing": "Làm mượt",

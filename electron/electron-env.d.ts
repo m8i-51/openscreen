@@ -41,8 +41,14 @@ interface Window {
 				error?: string;
 			};
 		}>;
+		openNotes: () => Promise<{
+			opened: boolean;
+			reason?: string;
+		}>;
 		selectSource: (source: ProcessedDesktopSource) => Promise<ProcessedDesktopSource | null>;
 		getSelectedSource: () => Promise<ProcessedDesktopSource | null>;
+		onSelectedSourceChanged: (callback: (source: ProcessedDesktopSource) => void) => () => void;
+		onSourceSelectorClosed: (callback: () => void) => () => void;
 		requestCameraAccess: () => Promise<{
 			success: boolean;
 			granted: boolean;
@@ -211,6 +217,25 @@ interface Window {
 			message?: string;
 			error?: string;
 		}>;
+		getReadableFileInfo: (filePath: string) => Promise<{
+			success: boolean;
+			size?: number;
+			mtimeMs?: number;
+			path?: string;
+			message?: string;
+			error?: string;
+		}>;
+		readFileChunk: (
+			filePath: string,
+			offset: number,
+			length: number,
+		) => Promise<{
+			success: boolean;
+			data?: ArrayBuffer;
+			bytesRead?: number;
+			message?: string;
+			error?: string;
+		}>;
 		preparePreviewAudioTrack: (filePath: string) => Promise<{
 			success: boolean;
 			path?: string | null;
@@ -229,7 +254,7 @@ interface Window {
 			canceled?: boolean;
 			error?: string;
 		}>;
-		loadProjectFile: () => Promise<{
+		loadProjectFile: (projectFolder?: string) => Promise<{
 			success: boolean;
 			path?: string;
 			project?: unknown;
@@ -275,6 +300,7 @@ interface Window {
 		hudOverlayClose: () => void;
 		setHudOverlayIgnoreMouseEvents: (ignore: boolean) => void;
 		moveHudOverlayBy: (deltaX: number, deltaY: number) => void;
+		setHudOverlaySize: (width: number, height: number) => void;
 		showCountdownOverlay: (value: number, runId: number) => Promise<void>;
 		setCountdownOverlayValue: (value: number, runId: number) => Promise<void>;
 		hideCountdownOverlay: (runId: number) => Promise<void>;

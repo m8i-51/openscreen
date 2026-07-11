@@ -44,7 +44,9 @@
 		"dualFrame": "Quadro Duplo",
 		"noWebcam": "Sem Webcam",
 		"webcamShape": "Formato da Câmera",
-		"webcamSize": "Tamanho da Webcam"
+		"webcamSize": "Tamanho da Webcam",
+		"reactiveWebcam": "Encolher ao ampliar",
+		"reactiveWebcamDescription": "A câmera diminui suavemente enquanto o vídeo está ampliado, para não atrapalhar."
 	},
 	"effects": {
 		"title": "Efeitos de Vídeo",
@@ -159,8 +161,7 @@
 		"tipShiftTabCycle": "Use Shift+Tab para alternar para trás.",
 		"invalidImageType": "Tipo de imagem inválido",
 		"imageFormatsOnly": "Por favor, envie um arquivo de imagem JPG, PNG, GIF ou WebP.",
-		"imageUploadSuccess": "Imagem enviada com sucesso!",
-		"failedImageUpload": "Falha ao enviar imagem"
+		"imageUploadSuccess": "Imagem enviada com sucesso!"
 	},
 	"fontStyles": {
 		"classic": "Clássico",
@@ -190,6 +191,17 @@
 		"failedToAdd": "Falha ao adicionar fonte",
 		"errorTimeout": "A fonte demorou muito para carregar. Por favor, verifique a URL e tente novamente.",
 		"errorLoadFailed": "A fonte não pôde ser carregada. Por favor, verifique se a URL do Google Fonts está correta."
+	},
+	"cursor": {
+		"theme": "Estilo do cursor",
+		"themeDefault": "Padrão",
+		"show": "Mostrar cursor",
+		"size": "Tamanho",
+		"smoothing": "Suavização",
+		"motionBlur": "Desfoque de movimento",
+		"clickBounce": "Rebote ao clicar",
+		"clipToBounds": "Recortar à tela",
+		"clipToBoundsDescription": "Mantém o cursor dentro do quadro do vídeo. Desative para permitir que o cursor ultrapasse as bordas — útil ao aplicar zoom ou ao deslocar."
 	},
 	"language": {
 		"title": "Idioma"

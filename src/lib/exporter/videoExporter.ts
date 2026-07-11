@@ -13,12 +13,44 @@ import { getPlatform } from "@/utils/platformUtils";
 import { AudioProcessor } from "./audioEncoder";
 import { FrameRenderer } from "./frameRenderer";
 import { VideoMuxer } from "./muxer";
+import { MAX_IN_MEMORY_SOURCE_BYTES } from "./sourceFileLimits";
 import { StreamingVideoDecoder } from "./streamingDecoder";
 import { TimestampedVideoFrameQueue } from "./timestampedVideoFrameQueue";
 import type { ExportConfig, ExportProgress, ExportResult } from "./types";
 
 const ENCODER_STALL_TIMEOUT_MS = 15_000;
 const ENCODER_FLUSH_TIMEOUT_MS = 20_000;
+
+/**
+ * Waits for the encoder's queue to drain below maxEncodeQueue before returning.
+ *
+ * The stall timer starts fresh on each call (not from the encoder's last output), so a
+ * long gap before this call — e.g. the decoder discarding frames inside a trim region —
+ * doesn't get blamed on the encoder once real frames resume.
+ */
+export async function waitForEncoderQueueSpace(params: {
+	getQueueSize: () => number;
+	maxEncodeQueue: number;
+	isCancelled: () => boolean;
+	encoderPreference: HardwareAcceleration;
+	now?: () => number;
+	sleep?: (ms: number) => Promise<void>;
+}): Promise<void> {
+	const now = params.now ?? Date.now;
+	const sleep = params.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+
+	const stallWaitStartAt = now();
+	while (params.getQueueSize() >= params.maxEncodeQueue && !params.isCancelled()) {
+		if (now() - stallWaitStartAt > ENCODER_STALL_TIMEOUT_MS) {
+			throw new Error(
+				params.encoderPreference === "prefer-hardware"
+					? "The hardware video encoder stopped responding. Retrying with a safer encoder."
+					: "The video encoder stopped responding during export.",
+			);
+		}
+		await sleep(5);
+	}
+}
 
 export interface VideoExporterConfig extends ExportConfig {
 	videoUrl: string;
@@ -37,6 +69,8 @@ export interface VideoExporterConfig extends ExportConfig {
 	cropRegion: CropRegion;
 	webcamLayoutPreset?: WebcamLayoutPreset;
 	webcamMaskShape?: import("@/components/video-editor/types").WebcamMaskShape;
+	webcamMirrored?: boolean;
+	webcamReactiveZoom?: boolean;
 	webcamSizePreset?: WebcamSizePreset;
 	webcamPosition?: { cx: number; cy: number } | null;
 	cursorRecordingData?: CursorRecordingData | null;
@@ -45,6 +79,7 @@ export interface VideoExporterConfig extends ExportConfig {
 	cursorMotionBlur?: number;
 	cursorClickBounce?: number;
 	cursorClipToBounds?: boolean;
+	cursorTheme?: string;
 	annotationRegions?: AnnotationRegion[];
 	previewWidth?: number;
 	previewHeight?: number;
@@ -149,7 +184,6 @@ export class VideoExporter {
 	private videoColorSpace: VideoColorSpaceInit | undefined;
 	private muxingPromises: Promise<void>[] = [];
 	private chunkCount = 0;
-	private lastEncoderOutputAt = 0;
 	private fatalEncoderError: Error | null = null;
 
 	constructor(config: VideoExporterConfig) {
@@ -212,7 +246,20 @@ export class VideoExporter {
 
 			const streamingDecoder = new StreamingVideoDecoder();
 			this.streamingDecoder = streamingDecoder;
-			const videoInfo = await streamingDecoder.loadMetadata(this.config.videoUrl);
+			const videoInfo = await streamingDecoder.loadMetadata(
+				this.config.videoUrl,
+				({ copiedBytes, totalBytes }) => {
+					// Large recordings are streamed into OPFS before demuxing; surface
+					// that copy as a "preparing" phase so the dialog is not stuck at 0%.
+					this.reportProgress({
+						currentFrame: 0,
+						totalFrames: 0,
+						percentage: totalBytes > 0 ? (copiedBytes / totalBytes) * 100 : 0,
+						estimatedTimeRemaining: 0,
+						phase: "preparing",
+					});
+				},
+			);
 			const sourceCopyResult = await this.trySourceCopyFastPath(videoInfo);
 			if (sourceCopyResult) {
 				return sourceCopyResult;
@@ -243,11 +290,14 @@ export class VideoExporter {
 				cursorMotionBlur: this.config.cursorMotionBlur,
 				cursorClickBounce: this.config.cursorClickBounce,
 				cursorClipToBounds: this.config.cursorClipToBounds,
+				cursorTheme: this.config.cursorTheme,
 				videoWidth: videoInfo.width,
 				videoHeight: videoInfo.height,
 				webcamSize: webcamInfo ? { width: webcamInfo.width, height: webcamInfo.height } : null,
 				webcamLayoutPreset: this.config.webcamLayoutPreset,
 				webcamMaskShape: this.config.webcamMaskShape,
+				webcamMirrored: this.config.webcamMirrored,
+				webcamReactiveZoom: this.config.webcamReactiveZoom,
 				webcamSizePreset: this.config.webcamSizePreset,
 				webcamPosition: this.config.webcamPosition,
 				annotationRegions: this.config.annotationRegions,
@@ -378,20 +428,16 @@ export class VideoExporter {
 							exportFrame = new VideoFrame(canvas, { timestamp, duration: frameDuration });
 						}
 
-						while (
-							this.encoder &&
-							this.encoder.encodeQueueSize >= maxEncodeQueue &&
-							!this.cancelled
-						) {
-							if (Date.now() - this.lastEncoderOutputAt > ENCODER_STALL_TIMEOUT_MS) {
-								exportFrame.close();
-								throw new Error(
-									encoderPreference === "prefer-hardware"
-										? "The hardware video encoder stopped responding. Retrying with a safer encoder."
-										: "The video encoder stopped responding during export.",
-								);
-							}
-							await new Promise((resolve) => setTimeout(resolve, 5));
+						try {
+							await waitForEncoderQueueSpace({
+								getQueueSize: () => this.encoder?.encodeQueueSize ?? 0,
+								maxEncodeQueue,
+								isCancelled: () => this.cancelled,
+								encoderPreference,
+							});
+						} catch (error) {
+							exportFrame.close();
+							throw error;
 						}
 
 						if (this.encoder && this.encoder.state === "configured") {
@@ -490,14 +536,11 @@ export class VideoExporter {
 		this.encodeQueue = 0;
 		this.muxingPromises = [];
 		this.chunkCount = 0;
-		this.lastEncoderOutputAt = Date.now();
 		this.fatalEncoderError = null;
 		let videoDescription: Uint8Array | undefined;
 
 		this.encoder = new VideoEncoder({
 			output: (chunk, meta) => {
-				this.lastEncoderOutputAt = Date.now();
-
 				if (meta?.decoderConfig?.description && !videoDescription) {
 					const desc = meta.decoderConfig.description;
 					if (desc instanceof ArrayBuffer || desc instanceof SharedArrayBuffer) {
@@ -642,7 +685,6 @@ export class VideoExporter {
 		this.chunkCount = 0;
 		this.videoDescription = undefined;
 		this.videoColorSpace = undefined;
-		this.lastEncoderOutputAt = 0;
 		this.fatalEncoderError = null;
 	}
 
@@ -700,6 +742,20 @@ export class VideoExporter {
 		const isRemoteUrl = /^(https?:|blob:|data:)/i.test(videoUrl);
 
 		if (!isRemoteUrl && window.electronAPI?.readBinaryFile) {
+			// The source-copy fast path reads the whole file into a Blob. That is
+			// impossible for recordings above Node's 2 GiB single-read cap, so bail
+			// out and let the (streaming) re-encode path handle them instead.
+			if (window.electronAPI.getReadableFileInfo) {
+				const info = await window.electronAPI.getReadableFileInfo(videoUrl);
+				if (
+					info.success &&
+					typeof info.size === "number" &&
+					info.size > MAX_IN_MEMORY_SOURCE_BYTES
+				) {
+					return null;
+				}
+			}
+
 			const result = await window.electronAPI.readBinaryFile(videoUrl);
 			if (!result.success || !result.data) {
 				return null;

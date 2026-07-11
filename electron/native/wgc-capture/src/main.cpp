@@ -632,8 +632,8 @@ int main(int argc, char* argv[]) {
                         (webcamOutputFrameIndex * 10'000'000ULL) / std::max(1, webcamCapture.fps()));
                     if (!webcamEncoder.writeBgraFrame(webcamFrame, webcamTimestampHns)) {
                         encodeFailed = true;
-                        stopRequested = true;
-                        cv.notify_all();
+                        control.stopRequested = true;
+                        control.cv.notify_all();
                         return;
                     }
                     lastWrittenWebcamSequence = latestWebcamSequence;
@@ -823,19 +823,34 @@ int main(int argc, char* argv[]) {
         });
     }
 
+    const auto stopStart = std::chrono::steady_clock::now();
+    auto logStopStep = [&](const char* step) {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - stopStart).count();
+        std::cerr << "[stop-timing] step=" << step << " elapsed_ms=" << ms << std::endl;
+    };
+
     microphoneCapture.stop();
+    logStopStep("microphone");
     loopbackCapture.stop();
+    logStopStep("loopback");
     webcamCapture.stop();
+    logStopStep("webcam");
     if (audioMixer) {
         audioMixer->stop();
     }
+    logStopStep("audio-mixer");
     stopVideoWriter();
+    logStopStep("video-writer-join");
     session.stop();
+    logStopStep("wgc-session-close");
     {
         std::scoped_lock lock(mutex);
         encoder.finalize();
+        logStopStep("encoder-finalize");
         if (writeSeparateWebcam) {
             webcamEncoder.finalize();
+            logStopStep("webcam-encoder-finalize");
         }
     }
 

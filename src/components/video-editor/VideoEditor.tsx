@@ -1,8 +1,9 @@
 import type { Span } from "dnd-timeline";
 import { FolderOpen, Languages, Save, Video } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
 import {
 	Dialog,
 	DialogContent,
@@ -11,11 +12,28 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import {
+	Select,
+	SelectContent,
+	SelectItem,
+	SelectTrigger,
+	SelectValue,
+} from "@/components/ui/select";
 import { useI18n, useScopedT } from "@/contexts/I18nContext";
 import { useShortcuts } from "@/contexts/ShortcutsContext";
 import { INITIAL_EDITOR_STATE, useEditorHistory } from "@/hooks/useEditorHistory";
 import { type Locale } from "@/i18n/config";
 import { getAvailableLocales, getLocaleName } from "@/i18n/loader";
+import {
+	captionSegmentsToAnnotationRegions,
+	extractMono16kFromVideoUrl,
+	MAX_CAPTION_AUDIO_SEC,
+	reconcileAutoCaptionTimelineGaps,
+	shiftTrimRegionsMsForCaptionBuffer,
+	transcribeMono16kToSegments,
+	trimLeadingSilenceMono16k,
+} from "@/lib/captioning";
 import { hasNativeCursorRecordingData } from "@/lib/cursor/nativeCursor";
 import {
 	calculateEffectiveSourceDimensions,
@@ -33,9 +51,10 @@ import {
 } from "@/lib/exporter";
 import { computeFrameStepTime } from "@/lib/frameStep";
 import type { CursorCaptureMode, ProjectMedia } from "@/lib/recordingSession";
-import { matchesShortcut } from "@/lib/shortcuts";
+import { isTextEditingTarget, matchesShortcut } from "@/lib/shortcuts";
 import {
 	getExportFolder,
+	getProjectFolder,
 	loadUserPreferences,
 	parentDirectoryOf,
 	saveUserPreferences,
@@ -68,8 +87,22 @@ import {
 	toFileUrl,
 	validateProjectData,
 } from "./projectPersistence";
+import {
+	buildPastedAnnotation,
+	buildSpeedRegion,
+	buildZoomRegion,
+	type CopiedRegion,
+	extractAnnotationAttributes,
+	extractSpeedAttributes,
+	extractZoomAttributes,
+	getCopiedRegion,
+	replaceAnnotationAttributes,
+	setCopiedRegion,
+} from "./regionClipboard";
+import { findFreeGapAt } from "./regionPlacement";
 import { SettingsPanel } from "./SettingsPanel";
 import TimelineEditor from "./timeline/TimelineEditor";
+import { buildAutoZoomSuggestions } from "./timeline/zoomSuggestionUtils";
 import {
 	type AnnotationRegion,
 	type BlurData,
@@ -94,6 +127,9 @@ import {
 } from "./types";
 import { UnsavedChangesDialog } from "./UnsavedChangesDialog";
 import VideoPlayback, { VideoPlaybackRef } from "./VideoPlayback";
+
+/** Single Sonner slot so auto-caption phases update in place instead of stacking. */
+const AUTO_CAPTION_PROGRESS_TOAST_ID = "auto-caption-progress";
 
 function isClickInteractionType(interactionType: string | null | undefined) {
 	return (
@@ -151,6 +187,8 @@ function buildSaveDiagnosticMessage(formatLabel: "GIF" | "Video", reason?: strin
 	return `${formatLabel} export save failed${reason ? `\nReason: ${reason}` : ""}`;
 }
 
+const CAPTION_WORD_CHOICES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] as const;
+
 export default function VideoEditor() {
 	const {
 		state: editorState,
@@ -164,6 +202,8 @@ export default function VideoEditor() {
 
 	const {
 		zoomRegions,
+		autoZoomEnabled,
+		autoFocusAll,
 		trimRegions,
 		speedRegions,
 		annotationRegions,
@@ -178,11 +218,13 @@ export default function VideoEditor() {
 		aspectRatio,
 		webcamLayoutPreset,
 		webcamMaskShape,
+		webcamMirrored,
+		webcamReactiveZoom,
 		webcamSizePreset,
 		webcamPosition,
 	} = editorState;
 
-	// ── Non-undoable state
+	// Non-undoable state
 	const [videoPath, setVideoPath] = useState<string | null>(null);
 	const [videoSourcePath, setVideoSourcePath] = useState<string | null>(null);
 	const [webcamVideoPath, setWebcamVideoPath] = useState<string | null>(null);
@@ -226,8 +268,8 @@ export default function VideoEditor() {
 	} | null>(null);
 	const [isFullscreen, setIsFullscreen] = useState(false);
 	const [showCloseConfirmDialog, setShowCloseConfirmDialog] = useState(false);
-	// Unsaved-changes confirmation for New Project / Load Project actions.
-	// (The window-close flow uses showCloseConfirmDialog above.)
+	// Unsaved-changes confirmation for New Project / Load Project.
+	// The window-close flow uses showCloseConfirmDialog above.
 	const [confirmDialogVariant, setConfirmDialogVariant] = useState<
 		"newProject" | "loadProject" | null
 	>(null);
@@ -260,6 +302,7 @@ export default function VideoEditor() {
 	const [cursorClipToBounds, setCursorClipToBounds] = useState(
 		DEFAULT_CURSOR_SETTINGS.clipToBounds,
 	);
+	const [cursorTheme, setCursorTheme] = useState(DEFAULT_CURSOR_SETTINGS.theme);
 	const [nativePlatform, setNativePlatform] = useState<NativePlatform | null>(null);
 	const [recordingCursorCaptureMode, setRecordingCursorCaptureMode] =
 		useState<CursorCaptureMode | null>(null);
@@ -271,9 +314,9 @@ export default function VideoEditor() {
 	const nextSpeedIdRef = useRef(1);
 
 	const { shortcuts, isMac } = useShortcuts();
-	// Native Windows recordings include captured cursor assets. Native macOS
-	// recordings hide the system cursor in ScreenCaptureKit and use telemetry
-	// samples with OpenScreen's default arrow asset for the editable overlay.
+	// Windows recordings include captured cursor assets. macOS hides the system
+	// cursor in ScreenCaptureKit and renders telemetry samples with OpenScreen's
+	// default arrow asset for the editable overlay.
 	const hasEditableCursorRecording =
 		recordingCursorCaptureMode === "editable-overlay" &&
 		(nativePlatform === "win32" || nativePlatform === "darwin") &&
@@ -283,10 +326,16 @@ export default function VideoEditor() {
 	const { locale, setLocale, t: rawT } = useI18n();
 	const t = useScopedT("editor");
 	const ts = useScopedT("settings");
+	const tt = useScopedT("timeline");
 	const availableLocales = getAvailableLocales();
 
 	const nextAnnotationIdRef = useRef(1);
 	const nextAnnotationZIndexRef = useRef(1);
+	const isAutoCaptioningRef = useRef(false);
+	const [isAutoCaptioning, setIsAutoCaptioning] = useState(false);
+	const [showAutoCaptionsDialog, setShowAutoCaptionsDialog] = useState(false);
+	const [captionWordsMin, setCaptionWordsMin] = useState(2);
+	const [captionWordsMax, setCaptionWordsMax] = useState(7);
 	const exporterRef = useRef<VideoExporter | null>(null);
 
 	const annotationOnlyRegions = useMemo(
@@ -359,6 +408,10 @@ export default function VideoEditor() {
 			setRecordingCursorCaptureMode(projectCursorCaptureMode);
 			setCurrentProjectPath(path ?? null);
 
+			// A loaded project keeps its zooms exactly as saved, so never auto-suggest
+			// over it (even if it has zero zooms because the user deleted them all).
+			autoProcessedSourceRef.current = sourcePath;
+
 			pushState({
 				wallpaper: normalizedEditor.wallpaper,
 				shadowIntensity: normalizedEditor.shadowIntensity,
@@ -369,12 +422,16 @@ export default function VideoEditor() {
 				padding: normalizedEditor.padding,
 				cropRegion: normalizedEditor.cropRegion,
 				zoomRegions: normalizedEditor.zoomRegions,
+				autoZoomEnabled: normalizedEditor.autoZoomEnabled,
+				autoFocusAll: normalizedEditor.autoFocusAll,
 				trimRegions: normalizedEditor.trimRegions,
 				speedRegions: normalizedEditor.speedRegions,
 				annotationRegions: normalizedEditor.annotationRegions,
 				aspectRatio: normalizedEditor.aspectRatio,
 				webcamLayoutPreset: normalizedEditor.webcamLayoutPreset,
 				webcamMaskShape: normalizedEditor.webcamMaskShape,
+				webcamMirrored: normalizedEditor.webcamMirrored,
+				webcamReactiveZoom: normalizedEditor.webcamReactiveZoom,
 				webcamSizePreset: normalizedEditor.webcamSizePreset,
 				webcamPosition: normalizedEditor.webcamPosition,
 			});
@@ -383,6 +440,7 @@ export default function VideoEditor() {
 			setGifFrameRate(normalizedEditor.gifFrameRate);
 			setGifLoop(normalizedEditor.gifLoop);
 			setGifSizePreset(normalizedEditor.gifSizePreset);
+			setCursorTheme(normalizedEditor.cursorTheme);
 
 			setSelectedZoomId(null);
 			setSelectedTrimId(null);
@@ -441,21 +499,28 @@ export default function VideoEditor() {
 			padding,
 			cropRegion,
 			zoomRegions,
+			autoZoomEnabled,
+			autoFocusAll,
 			trimRegions,
 			speedRegions,
 			annotationRegions,
 			aspectRatio,
 			webcamLayoutPreset,
 			webcamMaskShape,
+			webcamMirrored,
+			webcamReactiveZoom,
+			webcamSizePreset,
 			webcamPosition,
 			exportQuality,
 			exportFormat,
 			gifFrameRate,
 			gifLoop,
 			gifSizePreset,
+			cursorTheme,
 		});
 	}, [
 		currentProjectMedia,
+		cursorTheme,
 		wallpaper,
 		shadowIntensity,
 		showBlur,
@@ -465,12 +530,17 @@ export default function VideoEditor() {
 		padding,
 		cropRegion,
 		zoomRegions,
+		autoZoomEnabled,
+		autoFocusAll,
 		trimRegions,
 		speedRegions,
 		annotationRegions,
 		aspectRatio,
 		webcamLayoutPreset,
 		webcamMaskShape,
+		webcamMirrored,
+		webcamReactiveZoom,
+		webcamSizePreset,
 		webcamPosition,
 		exportQuality,
 		exportFormat,
@@ -533,8 +603,8 @@ export default function VideoEditor() {
 						createProjectSnapshot({ screenVideoPath: result.path }, INITIAL_EDITOR_STATE),
 					);
 				}
-				// No video/project/session — leave videoPath null so the
-				// EditorEmptyState dashboard renders instead of an error screen.
+				// No video/project/session, so leave videoPath null and let the
+				// EditorEmptyState dashboard render instead of an error screen.
 			} catch (err) {
 				setError("Error loading video: " + String(err));
 			} finally {
@@ -545,8 +615,7 @@ export default function VideoEditor() {
 		loadInitialData();
 	}, [applyLoadedProject]);
 
-	// Track whether user preferences have been loaded to avoid
-	// overwriting saved prefs with defaults on the first render
+	// Avoid overwriting saved prefs with defaults before they've loaded.
 	const [prefsHydrated, setPrefsHydrated] = useState(false);
 
 	// Load persisted user preferences on mount (intentionally runs once)
@@ -589,12 +658,16 @@ export default function VideoEditor() {
 				padding,
 				cropRegion,
 				zoomRegions,
+				autoZoomEnabled,
+				autoFocusAll,
 				trimRegions,
 				speedRegions,
 				annotationRegions,
 				aspectRatio,
 				webcamLayoutPreset,
 				webcamMaskShape,
+				webcamMirrored,
+				webcamReactiveZoom,
 				webcamSizePreset,
 				webcamPosition,
 				exportQuality,
@@ -602,6 +675,7 @@ export default function VideoEditor() {
 				gifFrameRate,
 				gifLoop,
 				gifSizePreset,
+				cursorTheme,
 			};
 			const projectData = createProjectData(currentProjectMedia, editorState);
 
@@ -610,8 +684,8 @@ export default function VideoEditor() {
 					.split(/[\\/]/)
 					.pop()
 					?.replace(/\.[^.]+$/, "") || `project-${Date.now()}`;
-			// Match the normalization path used by `currentProjectSnapshot` so the
-			// post-save baseline compares equal and `hasUnsavedChanges` clears.
+			// Normalize the same way as currentProjectSnapshot so the post-save
+			// baseline compares equal and hasUnsavedChanges clears.
 			const projectSnapshot = createProjectSnapshot(currentProjectMedia, editorState);
 			const result = await nativeBridgeClient.project.saveProjectFile(
 				projectData,
@@ -649,21 +723,26 @@ export default function VideoEditor() {
 			padding,
 			cropRegion,
 			zoomRegions,
+			autoZoomEnabled,
+			autoFocusAll,
 			trimRegions,
 			speedRegions,
 			annotationRegions,
 			aspectRatio,
 			webcamLayoutPreset,
 			webcamMaskShape,
+			webcamMirrored,
+			webcamReactiveZoom,
+			webcamSizePreset,
 			webcamPosition,
 			exportQuality,
 			exportFormat,
 			gifFrameRate,
 			gifLoop,
 			gifSizePreset,
+			cursorTheme,
 			videoPath,
 			t,
-			webcamSizePreset,
 		],
 	);
 
@@ -719,7 +798,7 @@ export default function VideoEditor() {
 	}, []);
 
 	const doLoadProject = useCallback(async () => {
-		const result = await nativeBridgeClient.project.loadProjectFile();
+		const result = await nativeBridgeClient.project.loadProjectFile(getProjectFolder());
 
 		if (result.canceled) {
 			return;
@@ -734,6 +813,13 @@ export default function VideoEditor() {
 		if (!restored) {
 			toast.error(t("project.invalidFormat"));
 			return;
+		}
+
+		if (result.path) {
+			const folder = parentDirectoryOf(result.path);
+			if (folder) {
+				saveUserPreferences({ projectFolder: folder });
+			}
 		}
 
 		toast.success(t("project.loadedFrom", { path: result.path ?? "" }));
@@ -788,6 +874,7 @@ export default function VideoEditor() {
 		setCursorMotionBlur(DEFAULT_CURSOR_SETTINGS.motionBlur);
 		setCursorClickBounce(DEFAULT_CURSOR_SETTINGS.clickBounce);
 		setCursorClipToBounds(DEFAULT_CURSOR_SETTINGS.clipToBounds);
+		setCursorTheme(DEFAULT_CURSOR_SETTINGS.theme);
 		// Reset region ID counters.
 		nextZoomIdRef.current = 1;
 		nextTrimIdRef.current = 1;
@@ -947,6 +1034,9 @@ export default function VideoEditor() {
 				depth: DEFAULT_ZOOM_DEPTH,
 				customScale: ZOOM_DEPTH_SCALES[DEFAULT_ZOOM_DEPTH],
 				focus: { cx: 0.5, cy: 0.5 },
+				// Auto-Focus on means new zooms follow the cursor too.
+				focusMode: autoFocusAll ? "auto" : undefined,
+				source: "manual",
 			};
 			pushState((prev) => ({ zoomRegions: [...prev.zoomRegions, newRegion] }));
 			setSelectedZoomId(id);
@@ -955,24 +1045,91 @@ export default function VideoEditor() {
 			setSelectedAnnotationId(null);
 			setSelectedBlurId(null);
 		},
-		[pushState],
+		[pushState, autoFocusAll],
 	);
 
-	const handleZoomSuggested = useCallback(
-		(span: Span, focus: ZoomFocus) => {
-			const id = `zoom-${nextZoomIdRef.current++}`;
-			const newRegion: ZoomRegion = {
-				id,
-				startMs: Math.round(span.start),
-				endMs: Math.round(span.end),
+	// Builds fresh "auto" zoom regions from cursor telemetry without overlapping
+	// existing ones. Used by both the on-load auto-suggest pass and the wand toggle.
+	const buildAutoZoomRegions = useCallback(
+		(existingRegions: ZoomRegion[]): ZoomRegion[] => {
+			const totalMs = Math.round(duration * 1000);
+			const suggestions = buildAutoZoomSuggestions({
+				cursorTelemetry,
+				totalMs,
+				existingRegions,
+				defaultDurationMs: Math.max(1000, Math.round(totalMs * 0.05)),
+			});
+			return suggestions.map((suggestion) => ({
+				id: `zoom-${nextZoomIdRef.current++}`,
+				startMs: Math.round(suggestion.span.start),
+				endMs: Math.round(suggestion.span.end),
 				depth: DEFAULT_ZOOM_DEPTH,
 				customScale: ZOOM_DEPTH_SCALES[DEFAULT_ZOOM_DEPTH],
-				focus: clampFocusToDepth(focus, DEFAULT_ZOOM_DEPTH),
-			};
-			// Bulk suggest must not steal selection — keeping a zoom selected hides
-			// the export panel (SettingsPanel gates it on !hasTimelineSelection),
-			// trapping users who just want to export after auto-zoom.
-			pushState((prev) => ({ zoomRegions: [...prev.zoomRegions, newRegion] }));
+				focus: clampFocusToDepth(suggestion.focus, DEFAULT_ZOOM_DEPTH),
+				focusMode: autoFocusAll ? ("auto" as const) : undefined,
+				source: "auto" as const,
+			}));
+		},
+		[cursorTelemetry, duration, autoFocusAll],
+	);
+
+	// Auto-suggest zooms once per fresh recording (no existing zooms, telemetry
+	// available, wand enabled). Loaded projects are marked processed elsewhere so
+	// they're never touched. The ref guard runs this once per source and survives undo.
+	const autoProcessedSourceRef = useRef<string | null>(null);
+	useEffect(() => {
+		if (!autoZoomEnabled || !cursorTelemetrySourcePath) return;
+		if (autoProcessedSourceRef.current === cursorTelemetrySourcePath) return;
+		if (cursorTelemetry.length < 2 || duration <= 0) return;
+		// Only auto-suggest for a fresh recording; don't disturb existing zooms.
+		if (zoomRegions.length > 0) {
+			autoProcessedSourceRef.current = cursorTelemetrySourcePath;
+			return;
+		}
+		const newRegions = buildAutoZoomRegions([]);
+		autoProcessedSourceRef.current = cursorTelemetrySourcePath;
+		if (newRegions.length === 0) return;
+		pushState((prev) => ({ zoomRegions: [...prev.zoomRegions, ...newRegions] }));
+	}, [
+		autoZoomEnabled,
+		cursorTelemetrySourcePath,
+		cursorTelemetry,
+		duration,
+		zoomRegions,
+		buildAutoZoomRegions,
+		pushState,
+	]);
+
+	// Wand toggle: ON regenerates suggestions around existing zooms; OFF removes
+	// only untouched auto zooms (manual and edited-to-manual survive).
+	const handleToggleAutoZoom = useCallback(
+		(enabled: boolean) => {
+			if (enabled) {
+				autoProcessedSourceRef.current = cursorTelemetrySourcePath;
+				pushState((prev) => ({
+					autoZoomEnabled: true,
+					zoomRegions: [...prev.zoomRegions, ...buildAutoZoomRegions(prev.zoomRegions)],
+				}));
+			} else {
+				pushState((prev) => ({
+					autoZoomEnabled: false,
+					zoomRegions: prev.zoomRegions.filter((region) => region.source !== "auto"),
+				}));
+			}
+		},
+		[pushState, buildAutoZoomRegions, cursorTelemetrySourcePath],
+	);
+
+	// Flip every zoom between auto (cursor-follow) and manual at once.
+	const handleToggleAutoFocusAll = useCallback(
+		(on: boolean) => {
+			pushState((prev) => ({
+				autoFocusAll: on,
+				zoomRegions: prev.zoomRegions.map((region) => ({
+					...region,
+					focusMode: on ? "auto" : "manual",
+				})),
+			}));
 		},
 		[pushState],
 	);
@@ -1004,6 +1161,7 @@ export default function VideoEditor() {
 								...region,
 								startMs: Math.round(span.start),
 								endMs: Math.round(span.end),
+								source: "manual",
 							}
 						: region,
 				),
@@ -1029,12 +1187,14 @@ export default function VideoEditor() {
 		[pushState],
 	);
 
-	// Focus drag: updateState for live preview, commitState on pointer-up
+	// Focus drag: updateState for live preview, commitState on pointer-up.
 	const handleZoomFocusChange = useCallback(
 		(id: string, focus: ZoomFocus) => {
 			updateState((prev) => ({
 				zoomRegions: prev.zoomRegions.map((region) =>
-					region.id === id ? { ...region, focus: clampFocusToDepth(focus, region.depth) } : region,
+					region.id === id
+						? { ...region, focus: clampFocusToDepth(focus, region.depth), source: "manual" }
+						: region,
 				),
 			}));
 		},
@@ -1052,6 +1212,7 @@ export default function VideoEditor() {
 								depth,
 								customScale: ZOOM_DEPTH_SCALES[depth],
 								focus: clampFocusToDepth(region.focus, depth),
+								source: "manual",
 							}
 						: region,
 				),
@@ -1067,7 +1228,9 @@ export default function VideoEditor() {
 			if (!Number.isFinite(rounded)) return;
 			updateState((prev) => ({
 				zoomRegions: prev.zoomRegions.map((region) =>
-					region.id === selectedZoomId ? { ...region, customScale: rounded } : region,
+					region.id === selectedZoomId
+						? { ...region, customScale: rounded, source: "manual" }
+						: region,
 				),
 			}));
 		},
@@ -1083,7 +1246,7 @@ export default function VideoEditor() {
 			if (!selectedZoomId) return;
 			pushState((prev) => ({
 				zoomRegions: prev.zoomRegions.map((region) =>
-					region.id === selectedZoomId ? { ...region, focusMode } : region,
+					region.id === selectedZoomId ? { ...region, focusMode, source: "manual" } : region,
 				),
 			}));
 		},
@@ -1110,9 +1273,9 @@ export default function VideoEditor() {
 					if (region.id !== selectedZoomId) return region;
 					if (preset === null) {
 						const { rotationPreset: _p, ...rest } = region;
-						return rest;
+						return { ...rest, source: "manual" };
 					}
-					return { ...region, rotationPreset: preset };
+					return { ...region, rotationPreset: preset, source: "manual" };
 				}),
 			}));
 		},
@@ -1260,8 +1423,11 @@ export default function VideoEditor() {
 
 	const handleAnnotationSpanChange = useCallback(
 		(id: string, span: Span) => {
-			pushState((prev) => ({
-				annotationRegions: prev.annotationRegions.map((region) =>
+			pushState((prev) => {
+				const editedAutoCaption =
+					prev.annotationRegions.find((region) => region.id === id)?.annotationSource ===
+					"auto-caption";
+				const next = prev.annotationRegions.map((region) =>
 					region.id === id
 						? {
 								...region,
@@ -1269,8 +1435,11 @@ export default function VideoEditor() {
 								endMs: Math.round(span.end),
 							}
 						: region,
-				),
-			}));
+				);
+				return {
+					annotationRegions: editedAutoCaption ? reconcileAutoCaptionTimelineGaps(next) : next,
+				};
+			});
 		},
 		[pushState],
 	);
@@ -1283,8 +1452,10 @@ export default function VideoEditor() {
 				const source = prev.annotationRegions.find((region) => region.id === id);
 				if (!source) return {};
 
+				const { annotationSource: _stripCaptionLink, ...sourceWithoutCaptionLink } = source;
+
 				const duplicate: AnnotationRegion = {
-					...source,
+					...sourceWithoutCaptionLink,
 					id: duplicateId,
 					zIndex: duplicateZIndex,
 					position: { x: source.position.x + 4, y: source.position.y + 4 },
@@ -1375,11 +1546,18 @@ export default function VideoEditor() {
 
 	const handleAnnotationStyleChange = useCallback(
 		(id: string, style: Partial<AnnotationRegion["style"]>) => {
-			pushState((prev) => ({
-				annotationRegions: prev.annotationRegions.map((region) =>
-					region.id === id ? { ...region, style: { ...region.style, ...style } } : region,
-				),
-			}));
+			pushState((prev) => {
+				const touched = prev.annotationRegions.find((r) => r.id === id);
+				const syncAutoCaptions = touched?.annotationSource === "auto-caption";
+				return {
+					annotationRegions: prev.annotationRegions.map((region) => {
+						if (syncAutoCaptions && region.annotationSource === "auto-caption") {
+							return { ...region, style: { ...region.style, ...style } };
+						}
+						return region.id === id ? { ...region, style: { ...region.style, ...style } } : region;
+					}),
+				};
+			});
 		},
 		[pushState],
 	);
@@ -1442,25 +1620,235 @@ export default function VideoEditor() {
 
 	const handleAnnotationPositionChange = useCallback(
 		(id: string, position: { x: number; y: number }) => {
-			pushState((prev) => ({
-				annotationRegions: prev.annotationRegions.map((region) =>
-					region.id === id ? { ...region, position } : region,
-				),
-			}));
+			pushState((prev) => {
+				const moved = prev.annotationRegions.find((r) => r.id === id);
+				const syncAutoCaptions = moved?.annotationSource === "auto-caption";
+				return {
+					annotationRegions: prev.annotationRegions.map((region) => {
+						if (syncAutoCaptions && region.annotationSource === "auto-caption") {
+							return { ...region, position };
+						}
+						return region.id === id ? { ...region, position } : region;
+					}),
+				};
+			});
 		},
 		[pushState],
 	);
 
 	const handleAnnotationSizeChange = useCallback(
 		(id: string, size: { width: number; height: number }) => {
-			pushState((prev) => ({
-				annotationRegions: prev.annotationRegions.map((region) =>
-					region.id === id ? { ...region, size } : region,
-				),
-			}));
+			pushState((prev) => {
+				const resized = prev.annotationRegions.find((r) => r.id === id);
+				const syncAutoCaptions = resized?.annotationSource === "auto-caption";
+				return {
+					annotationRegions: prev.annotationRegions.map((region) => {
+						if (syncAutoCaptions && region.annotationSource === "auto-caption") {
+							return { ...region, size };
+						}
+						return region.id === id ? { ...region, size } : region;
+					}),
+				};
+			});
 		},
 		[pushState],
 	);
+
+	const handleCopySelected = useCallback(() => {
+		// Copy the selected region of any kind into the clipboard. A selected blur is an
+		// annotation (type "blur" lives in annotationRegions), so it copies via that row.
+		const copyTargets = [
+			[selectedZoomId, zoomRegions, extractZoomAttributes, "zoom"],
+			[selectedSpeedId, speedRegions, extractSpeedAttributes, "speed"],
+			[
+				selectedAnnotationId ?? selectedBlurId,
+				annotationRegions,
+				extractAnnotationAttributes,
+				"annotation",
+			],
+		] as const;
+
+		for (const [id, regions, extract, kind] of copyTargets) {
+			if (!id) continue;
+			const region = (regions as readonly { id: string }[]).find((r) => r.id === id);
+			if (!region) continue; // Stale id — try the next target so the fallback toast stays reachable.
+			// Each row pairs a region list with its matching extractor, so the cast is sound.
+			setCopiedRegion((extract as (r: never) => CopiedRegion)(region as never));
+			// Blur lives in annotationRegions (type "blur") but its toast must label as "blur", not "text".
+			const labelKind = (region as { type?: string }).type === "blur" ? "blur" : kind;
+			toast.success(
+				t("regionClipboard.copied", { region: t(`regionClipboard.kinds.${labelKind}`) }),
+				{
+					id: "regionClipboard.copied",
+				},
+			);
+			return;
+		}
+		toast.info(t("regionClipboard.nothingToCopy"));
+	}, [
+		selectedZoomId,
+		selectedSpeedId,
+		selectedAnnotationId,
+		selectedBlurId,
+		zoomRegions,
+		speedRegions,
+		annotationRegions,
+		t,
+	]);
+
+	const handlePaste = useCallback(() => {
+		const copied = getCopiedRegion();
+		// If there's nothing in the clipboard, show a message and return early.
+		if (!copied) {
+			toast.info(t("regionClipboard.nothingToPaste"));
+			return;
+		}
+
+		// Apply onto the selected region of the same kind, keeping its timing.
+		if (copied.kind === "zoom" && selectedZoomId) {
+			pushState((prev) => ({
+				zoomRegions: prev.zoomRegions.map((r) =>
+					r.id === selectedZoomId ? buildZoomRegion(r, copied) : r,
+				),
+			}));
+			toast.success(
+				t("regionClipboard.pasted", { region: t(`regionClipboard.kinds.${copied.kind}`) }),
+				{
+					id: "regionClipboard.pasted",
+				},
+			);
+			return;
+		}
+		if (copied.kind === "speed" && selectedSpeedId) {
+			pushState((prev) => ({
+				speedRegions: prev.speedRegions.map((r) =>
+					r.id === selectedSpeedId ? buildSpeedRegion(r, copied) : r,
+				),
+			}));
+			toast.success(
+				t("regionClipboard.pasted", { region: t(`regionClipboard.kinds.${copied.kind}`) }),
+				{
+					id: "regionClipboard.pasted",
+				},
+			);
+			return;
+		}
+		// Blurs live in annotationRegions (type "blur"), so a selected blur is a valid target too.
+		if (copied.kind === "annotation" && (selectedAnnotationId || selectedBlurId)) {
+			const targetId = selectedAnnotationId ?? selectedBlurId;
+			pushState((prev) => ({
+				annotationRegions: prev.annotationRegions.map((r) =>
+					r.id === targetId ? replaceAnnotationAttributes(r, copied) : r,
+				),
+			}));
+			toast.success(
+				t("regionClipboard.pasted", { region: t(`regionClipboard.kinds.${copied.kind}`) }),
+				{
+					id: "regionClipboard.pasted",
+				},
+			);
+			return;
+		}
+
+		// Nothing matching selected → create a new region at the playhead.
+		const totalMs = Math.round(duration * 1000);
+		if (totalMs <= 0) return;
+		const defaultDuration = Math.min(Math.max(1000, Math.round(totalMs * 0.05)), totalMs);
+		const startPos = Math.max(0, Math.min(Math.round(currentTime * 1000), totalMs));
+
+		if (copied.kind === "zoom") {
+			const { ok, gapMs } = findFreeGapAt(zoomRegions, startPos, totalMs);
+			if (!ok) {
+				toast.error(tt("errors.cannotPlaceZoom"), {
+					description: tt("errors.zoomExistsAtLocation"),
+				});
+				return;
+			}
+			const id = `zoom-${nextZoomIdRef.current++}`;
+			const region = buildZoomRegion(
+				{
+					id,
+					startMs: startPos,
+					endMs: startPos + Math.min(defaultDuration, gapMs),
+					source: "manual",
+				},
+				copied,
+			);
+			pushState((prev) => ({ zoomRegions: [...prev.zoomRegions, region] }));
+			handleSelectZoom(id);
+			toast.success(
+				t("regionClipboard.pasted", { region: t(`regionClipboard.kinds.${copied.kind}`) }),
+				{
+					id: "regionClipboard.pasted",
+				},
+			);
+			return;
+		}
+
+		if (copied.kind === "speed") {
+			const { ok, gapMs } = findFreeGapAt(speedRegions, startPos, totalMs);
+			if (!ok) {
+				toast.error(tt("errors.cannotPlaceSpeed"), {
+					description: tt("errors.speedExistsAtLocation"),
+				});
+				return;
+			}
+			const id = `speed-${nextSpeedIdRef.current++}`;
+			const region = buildSpeedRegion(
+				{
+					id,
+					startMs: startPos,
+					endMs: startPos + Math.min(defaultDuration, gapMs),
+				},
+				copied,
+			);
+			pushState((prev) => ({ speedRegions: [...prev.speedRegions, region] }));
+			handleSelectSpeed(id);
+			toast.success(
+				t("regionClipboard.pasted", { region: t(`regionClipboard.kinds.${copied.kind}`) }),
+				{
+					id: "regionClipboard.pasted",
+				},
+			);
+			return;
+		}
+
+		// Annotation — overlaps are allowed. A brand-new region clones the full copy
+		// (type, content, styling, position), unlike the styling-only overwrite above.
+		const id = `annotation-${nextAnnotationIdRef.current++}`;
+		const region = buildPastedAnnotation(
+			{
+				id,
+				startMs: startPos,
+				endMs: Math.min(startPos + defaultDuration, totalMs),
+				zIndex: nextAnnotationZIndexRef.current++,
+			},
+			copied,
+		);
+		pushState((prev) => ({ annotationRegions: [...prev.annotationRegions, region] }));
+		handleSelectAnnotation(id);
+		toast.success(
+			t("regionClipboard.pasted", { region: t(`regionClipboard.kinds.${copied.kind}`) }),
+			{
+				id: "regionClipboard.pasted",
+			},
+		);
+	}, [
+		selectedZoomId,
+		selectedSpeedId,
+		selectedAnnotationId,
+		selectedBlurId,
+		zoomRegions,
+		speedRegions,
+		duration,
+		currentTime,
+		pushState,
+		handleSelectZoom,
+		handleSelectSpeed,
+		handleSelectAnnotation,
+		t,
+		tt,
+	]);
 
 	useEffect(() => {
 		const handleKeyDown = (e: KeyboardEvent) => {
@@ -1478,6 +1866,29 @@ export default function VideoEditor() {
 				e.stopPropagation();
 				redo();
 				return;
+			}
+
+			// Copy/paste region attributes. Skipped while typing in a field so native
+			// text copy/paste keeps working. Also only intercepted when there's an
+			// actual region selected (copy) or something on the clipboard (paste);
+			// otherwise the browser handles native copy/paste of any page selection.
+			const editingText = isTextEditingTarget(e.target);
+			if (!editingText) {
+				if (matchesShortcut(e, shortcuts.copySelected, isMac)) {
+					const hasRegionSelected =
+						selectedZoomId || selectedSpeedId || selectedAnnotationId || selectedBlurId;
+					if (hasRegionSelected) {
+						e.preventDefault();
+						handleCopySelected();
+						return;
+					}
+				} else if (matchesShortcut(e, shortcuts.paste, isMac)) {
+					if (getCopiedRegion()) {
+						e.preventDefault();
+						handlePaste();
+						return;
+					}
+				}
 			}
 
 			// Frame-step navigation (arrow keys, no modifiers)
@@ -1522,7 +1933,7 @@ export default function VideoEditor() {
 			}
 
 			if (matchesShortcut(e, shortcuts.playPause, isMac)) {
-				// Allow space only in inputs/textareas
+				// Let space pass through inside inputs/textareas.
 				if (isInput) {
 					return;
 				}
@@ -1536,7 +1947,18 @@ export default function VideoEditor() {
 
 		window.addEventListener("keydown", handleKeyDown, { capture: true });
 		return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
-	}, [undo, redo, shortcuts, isMac]);
+	}, [
+		undo,
+		redo,
+		shortcuts,
+		isMac,
+		handleCopySelected,
+		handlePaste,
+		selectedZoomId,
+		selectedSpeedId,
+		selectedAnnotationId,
+		selectedBlurId,
+	]);
 
 	useEffect(() => {
 		if (selectedZoomId && !zoomRegions.some((region) => region.id === selectedZoomId)) {
@@ -1658,9 +2080,8 @@ export default function VideoEditor() {
 				return;
 			}
 
-			// Ask the user where to save BEFORE starting the export. This avoids the
-			// post-export save dialog getting hidden behind other windows after a
-			// long-running export.
+			// Pick the save path before exporting, otherwise the save dialog can end up
+			// hidden behind other windows after a long-running export.
 			const isGifFormat = settings.format === "gif";
 			const targetFileName = `export-${Date.now()}.${isGifFormat ? "gif" : "mp4"}`;
 			const pickResult = await window.electronAPI.pickExportSavePath(
@@ -1696,7 +2117,7 @@ export default function VideoEditor() {
 						? getNativeAspectRatioValue(sourceWidth, sourceHeight, cropRegion)
 						: getAspectRatioValue(aspectRatio);
 
-				// Get preview CONTAINER dimensions for scaling
+				// Preview container dimensions, used for scaling.
 				const playbackRef = videoPlaybackRef.current;
 				const containerElement = playbackRef?.containerRef?.current;
 				const previewWidth = containerElement?.clientWidth || DEFAULT_SOURCE_DIMENSIONS.width;
@@ -1730,9 +2151,12 @@ export default function VideoEditor() {
 						cursorMotionBlur,
 						cursorClickBounce,
 						cursorClipToBounds,
+						cursorTheme,
 						annotationRegions,
 						webcamLayoutPreset,
 						webcamMaskShape,
+						webcamMirrored,
+						webcamReactiveZoom,
 						webcamSizePreset,
 						webcamPosition,
 						previewWidth,
@@ -1821,9 +2245,12 @@ export default function VideoEditor() {
 						cursorMotionBlur,
 						cursorClickBounce,
 						cursorClipToBounds,
+						cursorTheme,
 						annotationRegions,
 						webcamLayoutPreset,
 						webcamMaskShape,
+						webcamMirrored,
+						webcamReactiveZoom,
 						webcamSizePreset,
 						webcamPosition,
 						previewWidth,
@@ -1899,8 +2326,8 @@ export default function VideoEditor() {
 			} finally {
 				setIsExporting(false);
 				exporterRef.current = null;
-				// Reset dialog state to ensure it can be opened again on next export
-				// This fixes the bug where second export doesn't show save dialog
+				// Reset so the next export can reopen the dialog (second export
+				// otherwise wouldn't show the save dialog).
 				setShowExportDialog(false);
 				setExportProgress(null);
 			}
@@ -1925,6 +2352,8 @@ export default function VideoEditor() {
 			aspectRatio,
 			webcamLayoutPreset,
 			webcamMaskShape,
+			webcamMirrored,
+			webcamReactiveZoom,
 			webcamSizePreset,
 			webcamPosition,
 			exportQuality,
@@ -1937,6 +2366,7 @@ export default function VideoEditor() {
 			cursorMotionBlur,
 			cursorClickBounce,
 			cursorClipToBounds,
+			cursorTheme,
 			t,
 		],
 	);
@@ -2018,6 +2448,138 @@ export default function VideoEditor() {
 		}
 	}, []);
 
+	const generateAutoCaptions = useCallback(
+		async (minWords: number, maxWords: number) => {
+			if (!videoPath) {
+				toast.error(t("errors.noVideoLoaded"));
+				return;
+			}
+			if (isAutoCaptioningRef.current) {
+				toast.error(t("autoCaptions.busy"));
+				return;
+			}
+			const minW = Math.max(1, Math.min(minWords, maxWords));
+			const maxW = Math.max(minW, maxWords);
+
+			isAutoCaptioningRef.current = true;
+			setIsAutoCaptioning(true);
+			toast.loading(t("autoCaptions.generating"), { id: AUTO_CAPTION_PROGRESS_TOAST_ID });
+			try {
+				const { samples, truncated, durationSec } = await extractMono16kFromVideoUrl(videoPath);
+				if (!Number.isFinite(durationSec) || durationSec <= 0 || samples.length < 800) {
+					toast.dismiss(AUTO_CAPTION_PROGRESS_TOAST_ID);
+					toast.error(t("autoCaptions.noAudio"));
+					return;
+				}
+
+				const { samples: speechSamples, trimSec } = trimLeadingSilenceMono16k(samples);
+				if (speechSamples.length < 800) {
+					toast.dismiss(AUTO_CAPTION_PROGRESS_TOAST_ID);
+					toast.error(t("autoCaptions.noAudio"));
+					return;
+				}
+
+				const trimMs = Math.round(trimSec * 1000);
+				const trimRegionsForTranscribe = shiftTrimRegionsMsForCaptionBuffer(trimRegions, trimMs);
+
+				const transcribeOptions = {
+					onStatus: (phase: "model" | "transcribe") => {
+						if (phase === "model") {
+							toast.loading(t("autoCaptions.loadingModel"), {
+								id: AUTO_CAPTION_PROGRESS_TOAST_ID,
+							});
+						} else {
+							toast.loading(t("autoCaptions.transcribing"), {
+								id: AUTO_CAPTION_PROGRESS_TOAST_ID,
+							});
+						}
+					},
+				};
+
+				let { segments: segmentsRaw, granularity } = await transcribeMono16kToSegments(
+					speechSamples,
+					{
+						trimRegions: trimRegionsForTranscribe,
+						...transcribeOptions,
+					},
+				);
+				let transcribedFromTrimmedBuffer = true;
+
+				// Leading-silence trimming can return empty even when the full source has
+				// speech. Retry once against the untrimmed buffer before giving up.
+				if (segmentsRaw.length === 0 && trimSec > 0) {
+					({ segments: segmentsRaw, granularity } = await transcribeMono16kToSegments(samples, {
+						trimRegions,
+						...transcribeOptions,
+					}));
+					transcribedFromTrimmedBuffer = false;
+				}
+
+				const segments =
+					transcribedFromTrimmedBuffer && trimSec > 0
+						? segmentsRaw.map((s) => ({
+								...s,
+								startSec: s.startSec + trimSec,
+								endSec: s.endSec + trimSec,
+							}))
+						: segmentsRaw;
+
+				let { regions, nextNumericId, nextZIndex } = captionSegmentsToAnnotationRegions(
+					segments,
+					nextAnnotationIdRef.current,
+					nextAnnotationZIndexRef.current,
+					{
+						minWordsPerCaption: minW,
+						maxWordsPerCaption: maxW,
+						timestampGranularity: granularity,
+					},
+				);
+
+				if (regions.length === 0 && segments.length > 0) {
+					({ regions, nextNumericId, nextZIndex } = captionSegmentsToAnnotationRegions(
+						segments,
+						nextAnnotationIdRef.current,
+						nextAnnotationZIndexRef.current,
+						{
+							minWordsPerCaption: 1,
+							maxWordsPerCaption: Number.MAX_SAFE_INTEGER,
+							timestampGranularity: granularity,
+						},
+					));
+				}
+
+				if (regions.length === 0) {
+					toast.dismiss(AUTO_CAPTION_PROGRESS_TOAST_ID);
+					toast.info(t("autoCaptions.noneHeard"));
+					return;
+				}
+
+				pushState((prev) => ({ annotationRegions: [...prev.annotationRegions, ...regions] }));
+				nextAnnotationIdRef.current = nextNumericId;
+				nextAnnotationZIndexRef.current = nextZIndex;
+
+				toast.dismiss(AUTO_CAPTION_PROGRESS_TOAST_ID);
+				const minutesTrunc = String(Math.round(MAX_CAPTION_AUDIO_SEC / 60));
+				if (truncated) {
+					toast.success(t("autoCaptions.done", { count: String(regions.length) }), {
+						description: t("autoCaptions.truncated", { minutes: minutesTrunc }),
+					});
+				} else {
+					toast.success(t("autoCaptions.done", { count: String(regions.length) }));
+				}
+			} catch (e) {
+				console.error(e);
+				toast.dismiss(AUTO_CAPTION_PROGRESS_TOAST_ID);
+				const detail = e instanceof Error ? e.message : String(e);
+				toast.error(t("autoCaptions.failed"), { description: detail });
+			} finally {
+				isAutoCaptioningRef.current = false;
+				setIsAutoCaptioning(false);
+			}
+		},
+		[videoPath, trimRegions, pushState, t],
+	);
+
 	const handleSaveDiagnostic = useCallback(async () => {
 		const result = await window.electronAPI.saveDiagnostic({
 			error: exportError ?? "Manual diagnostic export",
@@ -2060,7 +2622,7 @@ export default function VideoEditor() {
 			<Dialog open={showNewRecordingDialog} onOpenChange={setShowNewRecordingDialog}>
 				<DialogContent
 					className="sm:max-w-[425px]"
-					style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
+					style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
 				>
 					<DialogHeader>
 						<DialogTitle>{t("newRecording.title")}</DialogTitle>
@@ -2085,13 +2647,92 @@ export default function VideoEditor() {
 				</DialogContent>
 			</Dialog>
 
+			<Dialog open={showAutoCaptionsDialog} onOpenChange={setShowAutoCaptionsDialog}>
+				<DialogContent
+					className="sm:max-w-md"
+					style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
+				>
+					<DialogHeader>
+						<DialogTitle>{t("autoCaptions.dialogTitle")}</DialogTitle>
+						<DialogDescription>{t("autoCaptions.dialogDescription")}</DialogDescription>
+					</DialogHeader>
+					<div className="grid gap-4 py-2">
+						<div className="grid gap-2">
+							<Label htmlFor="caption-min-words">{t("autoCaptions.minWords")}</Label>
+							<Select
+								value={String(captionWordsMin)}
+								onValueChange={(v) => {
+									const n = Number.parseInt(v, 10);
+									setCaptionWordsMin(n);
+									if (n > captionWordsMax) setCaptionWordsMax(n);
+								}}
+							>
+								<SelectTrigger id="caption-min-words" className="h-9">
+									<SelectValue />
+								</SelectTrigger>
+								<SelectContent>
+									{CAPTION_WORD_CHOICES.map((n) => (
+										<SelectItem key={`min-${n}`} value={String(n)}>
+											{t("autoCaptions.wordsCount", { count: String(n) })}
+										</SelectItem>
+									))}
+								</SelectContent>
+							</Select>
+						</div>
+						<div className="grid gap-2">
+							<Label htmlFor="caption-max-words">{t("autoCaptions.maxWords")}</Label>
+							<Select
+								value={String(captionWordsMax)}
+								onValueChange={(v) => {
+									const n = Number.parseInt(v, 10);
+									setCaptionWordsMax(n);
+									if (n < captionWordsMin) setCaptionWordsMin(n);
+								}}
+							>
+								<SelectTrigger id="caption-max-words" className="h-9">
+									<SelectValue />
+								</SelectTrigger>
+								<SelectContent>
+									{CAPTION_WORD_CHOICES.map((n) => (
+										<SelectItem key={`max-${n}`} value={String(n)}>
+											{t("autoCaptions.wordsCount", { count: String(n) })}
+										</SelectItem>
+									))}
+								</SelectContent>
+							</Select>
+						</div>
+					</div>
+					<DialogFooter className="gap-2 sm:gap-0">
+						<Button
+							type="button"
+							variant="outline"
+							onClick={() => setShowAutoCaptionsDialog(false)}
+							className="border-white/20 bg-transparent text-white hover:bg-white/10"
+						>
+							{t("autoCaptions.dialogCancel")}
+						</Button>
+						<Button
+							type="button"
+							disabled={isAutoCaptioning}
+							onClick={() => {
+								setShowAutoCaptionsDialog(false);
+								void generateAutoCaptions(captionWordsMin, captionWordsMax);
+							}}
+							className="bg-[#34B27B] text-white hover:bg-[#34B27B]/90"
+						>
+							{t("autoCaptions.generate")}
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
+
 			<div
 				className="h-11 flex-shrink-0 bg-[#070809]/85 backdrop-blur-xl border-b border-white/[0.07] flex items-center justify-between px-5 z-50 shadow-[0_1px_0_rgba(255,255,255,0.03)]"
-				style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
+				style={{ WebkitAppRegion: "drag" } as CSSProperties}
 			>
 				<div
 					className="flex-1 flex items-center gap-1"
-					style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
+					style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
 				>
 					<div
 						className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-white/50 hover:text-white/90 hover:bg-white/[0.08] transition-all duration-150 ${isMac ? "ml-14" : "ml-2"}`}
@@ -2137,7 +2778,7 @@ export default function VideoEditor() {
 				</div>
 			</div>
 
-			{/* Empty state — shown when no video is loaded */}
+			{/* Empty state shown when no video is loaded */}
 			{!videoPath && (
 				<div className="flex-1 min-h-0 relative">
 					<EditorEmptyState
@@ -2197,6 +2838,8 @@ export default function VideoEditor() {
 													webcamVideoPath={webcamVideoPath || undefined}
 													webcamLayoutPreset={webcamLayoutPreset}
 													webcamMaskShape={webcamMaskShape}
+													webcamMirrored={webcamMirrored}
+													webcamReactiveZoom={webcamReactiveZoom}
 													webcamSizePreset={webcamSizePreset}
 													webcamPosition={webcamPosition}
 													onWebcamPositionChange={(pos) => updateState({ webcamPosition: pos })}
@@ -2243,6 +2886,7 @@ export default function VideoEditor() {
 													cursorMotionBlur={cursorMotionBlur}
 													cursorClickBounce={cursorClickBounce}
 													cursorClipToBounds={cursorClipToBounds}
+													cursorTheme={cursorTheme}
 													isPreviewingZoom={isPreviewingZoom}
 												/>
 											</div>
@@ -2291,6 +2935,7 @@ export default function VideoEditor() {
 										onZoomFocusModeChange={(mode) =>
 											selectedZoomId && handleZoomFocusModeChange(mode)
 										}
+										focusModeLocked={autoFocusAll}
 										selectedZoomFocus={
 											selectedZoomId
 												? (zoomRegions.find((z) => z.id === selectedZoomId)?.focus ?? null)
@@ -2340,6 +2985,12 @@ export default function VideoEditor() {
 										}
 										webcamMaskShape={webcamMaskShape}
 										onWebcamMaskShapeChange={(shape) => pushState({ webcamMaskShape: shape })}
+										webcamMirrored={webcamMirrored}
+										webcamReactiveZoom={webcamReactiveZoom}
+										onWebcamMirroredChange={(mirrored) => pushState({ webcamMirrored: mirrored })}
+										onWebcamReactiveZoomChange={(reactive) =>
+											pushState({ webcamReactiveZoom: reactive })
+										}
 										webcamSizePreset={webcamSizePreset}
 										onWebcamSizePresetChange={(v) => updateState({ webcamSizePreset: v })}
 										onWebcamSizePresetCommit={commitState}
@@ -2423,6 +3074,8 @@ export default function VideoEditor() {
 										onCursorClickBounceChange={setCursorClickBounce}
 										cursorClipToBounds={cursorClipToBounds}
 										onCursorClipToBoundsChange={setCursorClipToBounds}
+										cursorTheme={cursorTheme}
+										onCursorThemeChange={setCursorTheme}
 										hasCursorData={
 											cursorTelemetry.length > 0 ||
 											hasNativeCursorRecordingData(cursorRecordingData)
@@ -2444,10 +3097,12 @@ export default function VideoEditor() {
 									videoDuration={duration}
 									currentTime={currentTime}
 									onSeek={handleSeek}
-									cursorTelemetry={cursorTelemetry}
 									zoomRegions={zoomRegions}
 									onZoomAdded={handleZoomAdded}
-									onZoomSuggested={handleZoomSuggested}
+									autoZoomEnabled={autoZoomEnabled}
+									onToggleAutoZoom={handleToggleAutoZoom}
+									autoFocusAll={autoFocusAll}
+									onToggleAutoFocusAll={handleToggleAutoFocusAll}
 									onZoomSpanChange={handleZoomSpanChange}
 									onZoomDelete={handleZoomDelete}
 									selectedZoomId={selectedZoomId}
@@ -2489,6 +3144,19 @@ export default function VideoEditor() {
 									}
 									videoUrl={videoPath ?? undefined}
 									showTrimWaveform={showTrimWaveform}
+									captionsLabel={t("autoCaptions.button")}
+									isGeneratingCaptions={isAutoCaptioning}
+									onGenerateCaptions={() => {
+										if (!videoPath) {
+											toast.error(t("errors.noVideoLoaded"));
+											return;
+										}
+										if (isAutoCaptioningRef.current) {
+											toast.error(t("autoCaptions.busy"));
+											return;
+										}
+										setShowAutoCaptionsDialog(true);
+									}}
 								/>
 							</div>
 						</Panel>
